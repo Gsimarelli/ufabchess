@@ -413,8 +413,21 @@ async function buildPartidasPanel(panelId) {
 
   const { data, error } = await supabase.rpc("get_my_match_reports");
 
+  /* ── Fallback: RPC não existe (migration não deployada) ou outro erro ── */
+  // 400 = RPC existe mas crashou internamente (tabela match_reports não existe)
+  // 42883 = função não existe
+  // Ambos os casos → usar fallback direto nos pairings
   if (error || !data?.success) {
-    panel.innerHTML = `<div class="report-empty">Erro ao carregar partidas.</div>`;
+    const fallbackResult = await buildPartidasFromPairings(panel);
+    if (fallbackResult) return;
+    panel.innerHTML = `
+      <div class="report-empty">
+        <div style="font-size:1.8rem;margin-bottom:10px;">⏳</div>
+        <p>Registro de resultados indisponível no momento.</p>
+        <p style="font-size:.8rem;color:var(--text-muted);margin-top:6px;">
+          Tente novamente em instantes.
+        </p>
+      </div>`;
     return;
   }
 
@@ -422,6 +435,7 @@ async function buildPartidasPanel(panelId) {
   const toConfirm  = data.to_confirm ?? [];
   const waiting    = data.waiting    ?? [];
   const disputed   = data.disputed   ?? [];
+  const history    = data.history    ?? [];
 
   // Badge na tab com total de ações necessárias
   const actionCount = pending.length + toConfirm.length;
@@ -433,13 +447,13 @@ async function buildPartidasPanel(panelId) {
 
   const totalPendente = pending.length + toConfirm.length + waiting.length + disputed.length;
 
-  if (totalPendente === 0) {
+  if (totalPendente === 0 && history.length === 0) {
     panel.innerHTML = `
       <div class="report-empty">
-        <div style="font-size:2rem;margin-bottom:12px;">✅</div>
-        <p>Nenhuma partida aguardando resultado.</p>
+        <div style="font-size:2rem;margin-bottom:12px;">♟️</div>
+        <p>Nenhuma partida registrada ainda.</p>
         <p style="font-size:.82rem;color:var(--text-muted);margin-top:6px;">
-          Os resultados aparecem aqui após o encerramento de cada torneio.
+          Os resultados aparecem aqui após você registrar suas partidas.
         </p>
       </div>`;
     return;
@@ -491,7 +505,173 @@ async function buildPartidasPanel(panelId) {
       </div>`;
   }
 
+  /* ── Seção 5: Histórico de partidas confirmadas ── */
+  if (history.length > 0) {
+    html += `
+      <div class="report-section">
+        <div class="report-section-title" style="color:var(--text-muted);">
+          📋 Histórico — ${history.length} partida${history.length > 1 ? "s" : ""}
+        </div>
+        ${history.map(r => buildHistoryCard(r)).join("")}
+      </div>`;
+  }
+
   panel.innerHTML = html;
+}
+
+/* ══════════════════════════════════════════════════════════════
+   FALLBACK: busca pairings diretamente quando RPC não existe
+   (migration ainda não deployada) ou durante in_progress
+══════════════════════════════════════════════════════════════ */
+
+async function buildPartidasFromPairings(panel) {
+  try {
+    // 1) Descobrir player_id pelo auth.uid()
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) return false;
+
+    const { data: playerRow } = await supabase
+      .from("players").select("id").eq("user_id", user.id).maybeSingle();
+    if (!playerRow) return false;
+
+    const pid = playerRow.id;
+
+    // 2) Buscar todas as sessões em andamento ou encerradas
+    const { data: sessions } = await supabase
+      .from("tournament_sessions")
+      .select("id, match_date, status, tournaments(name)")
+      .in("status", ["open", "in_progress", "finished"])
+      .order("match_date", { ascending: false });
+
+    if (!sessions?.length) {
+      panel.innerHTML = `
+        <div class="report-empty">
+          <div style="font-size:2rem;margin-bottom:12px;">✅</div>
+          <p>Nenhum torneio encerrado aguardando resultados.</p>
+        </div>`;
+      return true;
+    }
+
+    const sessionIds = sessions.map(s => s.id);
+    const sessionMap = Object.fromEntries(sessions.map(s => [s.id, s]));
+
+    // 3) Buscar pairings do jogador nessas sessões
+    // IMPORTANTE: usar column:column(fields) e não FK-name hints para evitar erro de nome
+    const [whiteRes, blackRes] = await Promise.all([
+      supabase.from("pairings")
+        .select("id, round_number, player_black, tournament_session_id, player_black:player_black(id, full_name)")
+        .eq("player_white", pid)
+        .in("tournament_session_id", sessionIds)
+        .not("player_black", "is", null),
+      supabase.from("pairings")
+        .select("id, round_number, player_white, tournament_session_id, player_white:player_white(id, full_name)")
+        .eq("player_black", pid)
+        .in("tournament_session_id", sessionIds)
+        .not("player_white", "is", null),
+    ]);
+
+    const whitePairings = (whiteRes.data ?? []).map(p => ({
+      pairing_id:      p.id,
+      report_id:       p.id,
+      round_number:    p.round_number,
+      tournament_name: sessionMap[p.tournament_session_id]?.tournaments?.name ?? "Torneio",
+      match_date:      sessionMap[p.tournament_session_id]?.match_date,
+      is_white:        true,
+      opponent_name:   (Array.isArray(p.player_black) ? p.player_black[0] : p.player_black)?.full_name ?? "Adversário",
+    }));
+
+    const blackPairings = (blackRes.data ?? []).map(p => ({
+      pairing_id:      p.id,
+      report_id:       p.id,
+      round_number:    p.round_number,
+      tournament_name: sessionMap[p.tournament_session_id]?.tournaments?.name ?? "Torneio",
+      match_date:      sessionMap[p.tournament_session_id]?.match_date,
+      is_white:        false,
+      opponent_name:   (Array.isArray(p.player_white) ? p.player_white[0] : p.player_white)?.full_name ?? "Adversário",
+    }));
+
+    // 4) Verificar quais pairings já têm resultado registrado
+    const allPairings = [...whitePairings, ...blackPairings];
+    if (!allPairings.length) {
+      panel.innerHTML = `
+        <div class="report-empty">
+          <div style="font-size:2rem;margin-bottom:12px;">♟</div>
+          <p>Nenhuma partida encontrada para registrar.</p>
+          <p style="font-size:.82rem;color:var(--text-muted);margin-top:6px;">
+            Os resultados aparecem após o encerramento de cada torneio.
+          </p>
+        </div>`;
+      return true;
+    }
+
+    const pairingIds = allPairings.map(p => p.pairing_id);
+
+    // Checar matches já registrados — busca por player_white/player_black direto
+    // (match.id ≠ pairing.id, são UUIDs independentes)
+    const { data: doneMatches } = await supabase
+      .from("matches")
+      .select("player_white, player_black, round_number")
+      .eq("player_white", pid)
+      .in("round_number", [...new Set(allPairings.map(p => p.round_number))]);
+
+    const { data: doneMatchesBlack } = await supabase
+      .from("matches")
+      .select("player_white, player_black, round_number")
+      .eq("player_black", pid)
+      .in("round_number", [...new Set(allPairings.map(p => p.round_number))]);
+
+    // Chave: round_number é suficiente por sessão (um jogador só joga 1x por rodada)
+    const doneRounds = new Set([
+      ...(doneMatches ?? []).map(m => m.round_number),
+      ...(doneMatchesBlack ?? []).map(m => m.round_number),
+    ]);
+
+    // Checar match_reports existentes (pode existir se migration foi deployada)
+    let reportedPairings = new Set();
+    try {
+      const { data: reports } = await supabase
+        .from("match_reports")
+        .select("pairing_id, status")
+        .in("pairing_id", pairingIds)
+        .in("status", ["reported", "confirmed", "auto_confirmed", "admin_resolved"]);
+      (reports ?? []).forEach(r => reportedPairings.add(r.pairing_id));
+    } catch (_) { /* tabela não existe ainda — ok */ }
+
+    const donePairingIds = new Set(reportedPairings);
+
+    const pending = allPairings.filter(p =>
+      !donePairingIds.has(p.pairing_id) && !doneRounds.has(p.round_number)
+    );
+
+    // Badge
+    const badge = document.getElementById("badge-partidas");
+    if (badge) {
+      badge.textContent = pending.length;
+      badge.style.display = pending.length > 0 ? "inline-flex" : "none";
+    }
+
+    if (!pending.length) {
+      panel.innerHTML = `
+        <div class="report-empty">
+          <div style="font-size:2rem;margin-bottom:12px;">✅</div>
+          <p>Todas as partidas já foram registradas.</p>
+        </div>`;
+      return true;
+    }
+
+    panel.innerHTML = `
+      <div class="report-section">
+        <div class="report-section-title">
+          📝 Registrar resultado — ${pending.length} partida${pending.length > 1 ? "s" : ""}
+        </div>
+        ${pending.map(r => buildPendingCard(r)).join("")}
+      </div>`;
+
+    return true;
+  } catch (e) {
+    console.warn("Fallback pairings query failed:", e);
+    return false;
+  }
 }
 
 /* ── Helpers de card ── */
@@ -567,24 +747,47 @@ function buildPendingCard(r) {
 
 /* Card: adversário reportou — jogador precisa confirmar ou contestar */
 function buildConfirmCard(r) {
-  const label = resultLabel(r.reported_result, r.is_white);
-  const color = resultColor(r.reported_result, r.is_white);
-  const countdown = autoConfirmCountdown(r.auto_confirm_at);
+  const playerResult = resultLabel(r.reported_result, r.is_white);  // do ponto de vista do jogador
+  const color        = resultColor(r.reported_result, r.is_white);
+  const countdown    = autoConfirmCountdown(r.auto_confirm_at);
+  const isDraw       = r.reported_result === "draw";
+  const isWin        = (r.reported_result === "white" && r.is_white) || (r.reported_result === "black" && !r.is_white);
+
+  const resultIcon  = isDraw ? "🤝" : isWin ? "🏆" : "❌";
+  const resultBig   = isDraw ? "EMPATE" : isWin ? "VOCÊ VENCEU" : "VOCÊ PERDEU";
+  const subtext     = isDraw
+    ? `${r.reported_by_name ?? "Seu adversário"} registrou empate nesta partida`
+    : isWin
+      ? `${r.reported_by_name ?? "Seu adversário"} confirmou sua vitória nesta partida`
+      : `${r.reported_by_name ?? "Seu adversário"} registrou a vitória dele nesta partida`;
+
   return `
     <div class="report-card report-card-urgent">
       ${matchHeader(r)}
-      <div class="report-result-reported">
-        <span style="font-size:.8rem;color:var(--text-muted);">${r.reported_by_name ?? "Adversário"} reportou:</span>
-        <strong style="color:${color};font-size:1rem;margin-left:6px;">${label}</strong>
+      <div style="
+        margin: 12px 0 8px;
+        padding: 14px;
+        background: ${color}18;
+        border: 1px solid ${color}44;
+        border-radius: var(--radius-sm);
+        text-align: center;
+      ">
+        <div style="font-size:1.6rem;margin-bottom:4px;">${resultIcon}</div>
+        <div style="font-size:1.1rem;font-weight:800;color:${color};letter-spacing:.5px;">
+          ${resultBig}
+        </div>
+        <div style="font-size:.78rem;color:var(--text-muted);margin-top:4px;">
+          ${subtext}
+        </div>
       </div>
-      <div style="font-size:.74rem;color:var(--text-muted);margin:4px 0 10px;">
-        ${countdown}
+      <div style="font-size:.74rem;color:var(--text-muted);margin-bottom:10px;text-align:center;">
+        ${countdown ? `⏱ ${countdown} sem resposta` : ""}
       </div>
       <div class="report-btns">
         <button class="btn-report btn-confirm"
           data-action="confirm"
           data-report-id="${r.report_id}">
-          ✓ Confirmar
+          ✓ Confirmar resultado
         </button>
         <button class="btn-report btn-dispute"
           data-action="dispute"
@@ -592,8 +795,7 @@ function buildConfirmCard(r) {
           ✗ Contestar
         </button>
       </div>
-    </div>`;
-}
+    </div>`; }
 
 /* Card: você reportou, aguardando adversário */
 function buildWaitingCard(r) {
@@ -630,9 +832,34 @@ function buildDisputedCard(r) {
     </div>`;
 }
 
-/* ═══════════════════════════════════════════
-   GRÁFICO DE RATING
-   ═══════════════════════════════════════════ */
+/* Card: partida confirmada — histórico */
+function buildHistoryCard(r) {
+  const result = r.final_result ?? r.reported_result;
+  const label  = resultLabel(result, r.is_white);
+  const color  = resultColor(result, r.is_white);
+  const isDraw = result === "draw";
+  const isWin  = (result === "white" && r.is_white) || (result === "black" && !r.is_white);
+  const icon   = isDraw ? "🤝" : isWin ? "🏆" : "❌";
+  const statusMap = {
+    confirmed:      "Confirmado pelo adversário",
+    auto_confirmed: "Confirmado automaticamente",
+    admin_resolved: "Resolvido pelo árbitro",
+  };
+  const statusLabel = statusMap[r.status] ?? "Confirmado";
+
+  return `
+    <div class="report-card" style="opacity:.85;border-left:3px solid ${color}66;">
+      ${matchHeader(r)}
+      <div style="display:flex;align-items:center;gap:10px;margin-top:10px;">
+        <span style="font-size:1.3rem;">${icon}</span>
+        <div>
+          <div style="font-weight:700;color:${color};font-size:.95rem;">${label}</div>
+          <div style="font-size:.72rem;color:var(--text-muted);">${statusLabel}</div>
+        </div>
+      </div>
+    </div>`;
+}
+
 
 let allOwnHistory = [];
 

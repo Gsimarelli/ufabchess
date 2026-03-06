@@ -317,6 +317,11 @@ async function generateRoundDiario(sessionId, roundNumber, btn) {
   if (byeId) lines.push(`⚠️ BYE: um jogador ficou sem par`);
 
   alert(`✅ Rodada ${roundNumber} / ${total} gerada!\n${players} jogadores · ${pairings.length} mesas\n\n${lines.join("\n")}`);
+  // Após o alert de sucesso da rodada:
+  await supabase.rpc("create_pending_reports_for_round", {
+  p_session_id: sessionId,
+  p_round:      roundNumber
+  });
 
   // Email com round_number → filtra só esta rodada
   btn.textContent = "📧 Enviando emails...";
